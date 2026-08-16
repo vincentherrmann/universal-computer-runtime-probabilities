@@ -10,7 +10,7 @@ from tqdm import tqdm
 from typing import Iterator
 
 # --- Configuration ---
-MAX_PROGRAM_LENGTH = 5
+MAX_PROGRAM_LENGTH = 11
 MAX_EXECUTION_STEPS = 100_000
 BRAINFUCK_ALPHABET = "+-<>[]."  # Using the 7-char alphabet
 MAX_OUTPUT_SIZE = 4096
