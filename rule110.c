@@ -2,183 +2,265 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h> // Added for printf
+#include <stdio.h>
 
-// --- Data Structures ---
+// 14-bit background ether pattern from Matthew Cook's universality proof:
+// 11111000100110
+// Temporal period is 7, spatial period is 14.
+static const uint8_t ether_table[7][14] = {
+    {1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0}, // t=0
+    {1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1}, // t=1
+    {1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0}, // t=2
+    {1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1}, // t=3
+    {1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1}, // t=4
+    {0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0}, // t=5
+    {0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0}  // t=6
+};
 
-// Represents one simulation state packed into bits
-// For width=512, we need 8 x 64-bit integers.
-typedef struct {
-    uint64_t* words;
-    int num_words;
-    int width_bits;
-} State;
+static inline uint8_t get_ether(int x, int t) {
+    int rem = x % 14;
+    if (rem < 0) rem += 14;
+    return ether_table[t % 7][rem];
+}
 
-// A simple hash table entry
-typedef struct {
-    int generation;     // Used to invalidate entries without memset
-    int step_index;     // At which step was this seen?
-    uint64_t* state_data; // Pointer to the stored state in the arena
-} HashEntry;
-
-// The Engine holds all memory to avoid re-allocation
+// Engine for fast Rule 110 simulation on two-sided infinite tape with ether background
 typedef struct {
     int max_steps;
-    int width;
-    int num_words;
+    int width;       // Total width in bits (multiple of 64, >= 2 * max_steps + 128)
+    int num_words;   // width / 64
+    int w_left;      // Number of cells with negative positions: x in [-w_left, -1]
+    int w_right;     // Number of cells with non-negative positions: x in [0, w_right - 1]
 
-    // Arena for storing historical states to compare against
-    // Layout: A giant block of uint64_t.
-    // storage[step * num_words] is the start of the state for that step.
-    uint64_t* history_arena;
-
-    // Hash Table for O(1) loop detection
-    HashEntry* hash_table;
-    size_t hash_size;
-
-    int current_generation;
+    uint64_t* state_a;
+    uint64_t* state_b;
+    uint64_t* mask;
+    uint64_t* expected;
 } Engine;
-
-// --- Helpers ---
-
-// Mix bits for a quick hash
-static inline uint64_t hash_state(const uint64_t* data, int num_words) {
-    uint64_t h = 0xcbf29ce484222325ULL; // FNV offset
-    for (int i = 0; i < num_words; i++) {
-        h ^= data[i];
-        h *= 0x109951162821199ULL; // FNV prime
-    }
-    return h;
-}
-
-// Bitwise implementation of Rule 110
-// Formula: (~L & R) | (C ^ R)
-// This calculates 64 cells in parallel.
-static inline void evolve_state(uint64_t* current, uint64_t* next, int num_words) {
-    for (int i = 0; i < num_words; i++) {
-        uint64_t C = current[i];
-
-        uint64_t prev_word = (i == 0) ? current[num_words - 1] : current[i - 1];
-        uint64_t next_word = (i == num_words - 1) ? current[0] : current[i + 1];
-
-        // CORRECTED: L shifts Right (>>). R shifts Left (<<).
-        // L pulls the LSB (bit 0) of prev_word into the MSB (bit 63)
-        // R pulls the MSB (bit 63) of next_word into the LSB (bit 0)
-        uint64_t L = (C >> 1) | (prev_word << 63);
-        uint64_t R = (C << 1) | (next_word >> 63);
-
-        next[i] = (~L & R) | (C ^ R);
-    }
-}
 
 // --- API ---
 
+// Create engine. If width < 2 * max_steps + 128, it is automatically sized to 2 * max_steps + 128
+// to mathematically guarantee that speed-of-light perturbation never reaches outer boundaries.
 Engine* create_engine(int width, int max_steps) {
+    int required_width = 2 * max_steps + 128;
+    if (width < required_width) {
+        width = required_width;
+    }
+    if (width % 64 != 0) {
+        width = ((width + 63) / 64) * 64;
+    }
     Engine* eng = (Engine*)malloc(sizeof(Engine));
     eng->width = width;
     eng->num_words = width / 64;
     eng->max_steps = max_steps;
-    eng->current_generation = 0;
+    eng->w_left = width / 2;
+    eng->w_right = width - eng->w_left;
 
-    // Hash table size: Power of 2 > max_steps * 2 for low load factor
-    eng->hash_size = 1;
-    while (eng->hash_size <= (size_t)max_steps * 2) eng->hash_size <<= 1;
-
-    eng->hash_table = (HashEntry*)calloc(eng->hash_size, sizeof(HashEntry));
-
-    // Allocate ONE block of memory for all history states
-    // size: (max_steps + 1) * num_words * 8 bytes
-    eng->history_arena = (uint64_t*)malloc((max_steps + 1) * eng->num_words * sizeof(uint64_t));
+    eng->state_a = (uint64_t*)calloc(eng->num_words, sizeof(uint64_t));
+    eng->state_b = (uint64_t*)calloc(eng->num_words, sizeof(uint64_t));
+    eng->mask = (uint64_t*)calloc(eng->num_words, sizeof(uint64_t));
+    eng->expected = (uint64_t*)calloc(eng->num_words, sizeof(uint64_t));
 
     return eng;
 }
 
 void free_engine(Engine* eng) {
     if (eng) {
-        free(eng->hash_table);
-        free(eng->history_arena);
+        free(eng->state_a);
+        free(eng->state_b);
+        free(eng->mask);
+        free(eng->expected);
         free(eng);
     }
 }
 
-// Returns: step number where loop was closed, or -1 if no loop found.
-// Writes the final state into result_buffer (must be uint8_t array of size width).
-int run_simulation(Engine* eng, const uint8_t* initial_state, uint8_t* result_buffer, int verbose) {
-    eng->current_generation++;
-    int cur_gen = eng->current_generation;
+// Run simulation with initial program placed at x = 0 ... prog_len - 1
+// All other positions (x < 0 and x >= prog_len) are filled with the 14-bit ether pattern.
+// Boundary conditions at left (x = -w_left) and right (x = w_right - 1) use dynamic ether E(x, t).
+//
+// Halting Criterion:
+// Halts when the interval [-7, prog_len + 6] is identical to the original (t=0) ether pattern.
+// Returns the step number when halted, or -1 if max_steps is reached without halting.
+int run_simulation(
+    Engine* eng,
+    const uint8_t* program,
+    int prog_len,
+    uint8_t* result_buffer,
+    int verbose
+) {
+    int width = eng->width;
     int num_words = eng->num_words;
-    uint64_t mask = eng->hash_size - 1;
+    int w_left = eng->w_left;
+    int max_steps = eng->max_steps;
 
-    // 1. Pack initial state into the first slot of history arena
-    uint64_t* current_state_ptr = &eng->history_arena[0];
-    memset(current_state_ptr, 0, num_words * sizeof(uint64_t));
+    uint64_t* cur = eng->state_a;
+    uint64_t* nxt = eng->state_b;
+    uint64_t* mask = eng->mask;
+    uint64_t* expected = eng->expected;
 
-    for (int i = 0; i < eng->width; i++) {
-        if (initial_state[i]) {
-            current_state_ptr[i / 64] |= (1ULL << (63 - (i % 64)));
+    // 1. Determine halting check boundaries
+    int first_bit = w_left - 7;
+    int last_bit = w_left + prog_len + 6;
+    if (first_bit < 0) first_bit = 0;
+    if (last_bit >= width) last_bit = width - 1;
+
+    int first_word = first_bit / 64;
+    int last_word = last_bit / 64;
+
+    // Initial active words around the program and halting interval
+    int cur_w_start = (w_left - 64) / 64;
+    int cur_w_end = (w_left + prog_len + 64) / 64;
+    if (cur_w_start < 0) cur_w_start = 0;
+    if (cur_w_end >= num_words) cur_w_end = num_words - 1;
+
+    // Clear active portion of buffers
+    for (int w = cur_w_start; w <= cur_w_end; w++) {
+        cur[w] = 0;
+        mask[w] = 0;
+        expected[w] = 0;
+    }
+
+    // 2. Initialize active tape with ether at t=0, overwritten by program at x = 0 .. prog_len - 1
+    for (int w = cur_w_start; w <= cur_w_end; w++) {
+        uint64_t word_val = 0;
+        for (int b = 0; b < 64; b++) {
+            int i = w * 64 + b;
+            int x = i - w_left;
+            uint8_t bit;
+            if (x >= 0 && x < prog_len) {
+                bit = program[x] ? 1 : 0;
+            } else {
+                bit = get_ether(x, 0);
+            }
+            if (bit) {
+                word_val |= (1ULL << (63 - b));
+            }
+        }
+        cur[w] = word_val;
+    }
+
+    // 3. Precompute halting masks for interval x in [-7, prog_len + 6]
+    for (int i = first_bit; i <= last_bit; i++) {
+        int w = i / 64;
+        int b = 63 - (i % 64);
+        int x = i - w_left;
+        mask[w] |= (1ULL << b);
+        if (get_ether(x, 0)) {
+            expected[w] |= (1ULL << b);
         }
     }
 
-    // 2. Loop
-    for (int step = 0; step < eng->max_steps; step++) {
+    if (verbose) {
+        printf("Step %4d: ", 0);
+        int print_start = w_left - 20;
+        int print_end = w_left + prog_len + 20;
+        if (print_start < 0) print_start = 0;
+        if (print_end > width) print_end = width;
 
-        // --- DEBUG PRINTING ---
+        for (int i = print_start; i < print_end; i++) {
+            int bit = (cur[i / 64] >> (63 - (i % 64))) & 1;
+            putchar(bit ? '#' : '.');
+        }
+        putchar('\n');
+    }
+
+    // 4. Main simulation loop with adaptive light-cone expansion
+    for (int step = 1; step <= max_steps; step++) {
+        // Expand active words as light-cone spreads
+        int req_w_start = (w_left - step - 1) / 64;
+        int req_w_end = (w_left + prog_len + step) / 64;
+        if (req_w_start < 0) req_w_start = 0;
+        if (req_w_end >= num_words) req_w_end = num_words - 1;
+
+        // Initialize newly entered words with pure background ether at step - 1
+        while (cur_w_start > req_w_start) {
+            cur_w_start--;
+            uint64_t word_val = 0;
+            for (int b = 0; b < 64; b++) {
+                int pos = cur_w_start * 64 + b - w_left;
+                if (get_ether(pos, step - 1)) {
+                    word_val |= (1ULL << (63 - b));
+                }
+            }
+            cur[cur_w_start] = word_val;
+            mask[cur_w_start] = 0;
+            expected[cur_w_start] = 0;
+        }
+        while (cur_w_end < req_w_end) {
+            cur_w_end++;
+            uint64_t word_val = 0;
+            for (int b = 0; b < 64; b++) {
+                int pos = cur_w_end * 64 + b - w_left;
+                if (get_ether(pos, step - 1)) {
+                    word_val |= (1ULL << (63 - b));
+                }
+            }
+            cur[cur_w_end] = word_val;
+            mask[cur_w_end] = 0;
+            expected[cur_w_end] = 0;
+        }
+
+        // Boundary bits for active window
+        uint64_t left_bit = (uint64_t)get_ether(cur_w_start * 64 - w_left - 1, step - 1);
+        uint64_t right_bit = (uint64_t)get_ether((cur_w_end + 1) * 64 - w_left, step - 1);
+
+        for (int i = cur_w_start; i <= cur_w_end; i++) {
+            uint64_t C = cur[i];
+            uint64_t prev_w = (i == cur_w_start) ? left_bit : cur[i - 1];
+            uint64_t next_w = (i == cur_w_end) ? (right_bit << 63) : cur[i + 1];
+
+            uint64_t L = (C >> 1) | (prev_w << 63);
+            uint64_t R = (C << 1) | (next_w >> 63);
+
+            nxt[i] = (~L & R) | (C ^ R);
+        }
+
+        uint64_t* tmp = cur;
+        cur = nxt;
+        nxt = tmp;
+
         if (verbose) {
             printf("Step %4d: ", step);
-            for (int i = 0; i < eng->width; i++) {
-                int w_idx = i / 64;
-                int b_idx = 63 - (i % 64);
-                int bit = (current_state_ptr[w_idx] >> b_idx) & 1;
-                // Use putc for speed, though printf is fine too
-                putc(bit ? '1' : '.', stdout);
+            int print_start = w_left - 20;
+            int print_end = w_left + prog_len + 20;
+            if (print_start < 0) print_start = 0;
+            if (print_end > width) print_end = width;
+
+            for (int i = print_start; i < print_end; i++) {
+                int bit = (cur[i / 64] >> (63 - (i % 64))) & 1;
+                putchar(bit ? '#' : '.');
             }
-            putc('\n', stdout);
+            putchar('\n');
         }
-        // ----------------------
 
-        // a. Hash current state
-        uint64_t h = hash_state(current_state_ptr, num_words);
-        size_t idx = h & mask;
-
-        // b. Check Hash Map (Linear Probing)
-        while (1) {
-            HashEntry* entry = &eng->hash_table[idx];
-
-            if (entry->generation != cur_gen) {
-                entry->generation = cur_gen;
-                entry->step_index = step;
-                entry->state_data = current_state_ptr;
+        // 5. Check halting condition: interval [-7, prog_len + 6] matches original ether
+        bool match = true;
+        for (int w = first_word; w <= last_word; w++) {
+            if ((cur[w] & mask[w]) != expected[w]) {
+                match = false;
                 break;
             }
-
-            bool match = true;
-            for(int w=0; w<num_words; w++) {
-                if (current_state_ptr[w] != entry->state_data[w]) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match) {
-                if (verbose) printf("Loop detected! Returning to step %d\n", entry->step_index);
-
-                // Unpack state to result buffer
-                for (int i = 0; i < eng->width; i++) {
-                    int w_idx = i / 64;
-                    int b_idx = 63 - (i % 64);
-                    result_buffer[i] = (current_state_ptr[w_idx] >> b_idx) & 1;
-                }
-                return step;
-            }
-
-            idx = (idx + 1) & mask;
         }
 
-        // c. Evolve state
-        uint64_t* next_state_ptr = &eng->history_arena[(step + 1) * num_words];
-        evolve_state(current_state_ptr, next_state_ptr, num_words);
+        if (match) {
+            if (verbose) {
+                printf("--> HALTED at step %d (interval [-7, %d] returned to original ether pattern)\n", step, prog_len + 6);
+            }
 
-        current_state_ptr = next_state_ptr;
+            if (result_buffer) {
+                for (int i = 0; i < width; i++) {
+                    result_buffer[i] = (cur[i / 64] >> (63 - (i % 64))) & 1;
+                }
+            }
+            return step;
+        }
+    }
+
+    // Did not halt within max_steps
+    if (result_buffer) {
+        for (int i = 0; i < width; i++) {
+            result_buffer[i] = (cur[i / 64] >> (63 - (i % 64))) & 1;
+        }
     }
 
     return -1;
